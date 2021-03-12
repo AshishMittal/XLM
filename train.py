@@ -8,10 +8,11 @@
 import json
 import random
 import argparse
+import os
 
 from src.slurm import init_signal_handler, init_distributed_mode
 from src.data.loader import check_data_params, load_data
-from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order
+from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order, output_parameter_sizes, output_gradient
 from src.model import check_model_params, build_model
 from src.model.memory import HashingMemory
 from src.trainer import SingleTrainer, EncDecTrainer
@@ -24,6 +25,24 @@ def get_parser():
     """
     # parse parameters
     parser = argparse.ArgumentParser(description="Language transfer")
+
+    # added parameters
+    parser.add_argument("--multiple_files", type=bool_flag, default=False)
+
+    parser.add_argument("--lang_specific_LN", type=bool_flag, default=False)
+    parser.add_argument("--lang_specific_FFN", type=bool_flag, default=False)
+    parser.add_argument("--lang_specific_ATTN", type=bool_flag, default=False)
+    parser.add_argument("--lang_specific_ADPT", type=bool_flag, default=False)
+    parser.add_argument("--ADPT_dim", type=int, default=128)
+
+    parser.add_argument("--do_meta_update", type=bool_flag, default=False)
+    parser.add_argument("--use_current_lr", type=bool_flag, default=True)
+    parser.add_argument("--shared_param_only_optimizer", type=bool_flag, default=False)
+    parser.add_argument("--meta_use_valid_set", type=bool_flag, default=True)
+    parser.add_argument("--only_valid_other_langs", type=bool_flag, default=False)
+    parser.add_argument("--adapt_lr", type=float, default=0.01)
+    parser.add_argument("--valid_max_batch_size", type=int, default=64)
+
 
     # main parameters
     parser.add_argument("--dump_path", type=str, default="./dumped/",
@@ -254,6 +273,10 @@ def main(params):
     # set sampling probabilities for training
     set_sampling_probs(data, params)
 
+    params.lgs = lgs = params.lgs.split("-")
+    if len(lgs) == 1:
+        lgs.append(lgs[0])
+
     # language model training
     for _ in range(params.max_epoch):
 
@@ -263,29 +286,14 @@ def main(params):
 
         while trainer.n_sentences < trainer.epoch_size:
 
-            # CLM steps
-            for lang1, lang2 in shuf_order(params.clm_steps, params):
-                trainer.clm_step(lang1, lang2, params.lambda_clm)
-
-            # MLM steps (also includes TLM if lang2 is not None)
+            # Replace the original MLM steps
             for lang1, lang2 in shuf_order(params.mlm_steps, params):
-                trainer.mlm_step(lang1, lang2, params.lambda_mlm)
 
-            # parallel classification steps
-            for lang1, lang2 in shuf_order(params.pc_steps, params):
-                trainer.pc_step(lang1, lang2, params.lambda_pc)
+                if params.do_meta_update:
+                    trainer.meta_mlm_step(lang1)
+                else:
+                    trainer.mlm_step(lang1, lang2, params.lambda_mlm)
 
-            # denoising auto-encoder steps
-            for lang in shuf_order(params.ae_steps):
-                trainer.mt_step(lang, lang, params.lambda_ae)
-
-            # machine translation steps
-            for lang1, lang2 in shuf_order(params.mt_steps, params):
-                trainer.mt_step(lang1, lang2, params.lambda_mt)
-
-            # back-translation steps
-            for lang1, lang2, lang3 in shuf_order(params.bt_steps):
-                trainer.bt_step(lang1, lang2, lang3, params.lambda_bt)
 
             trainer.iter()
 

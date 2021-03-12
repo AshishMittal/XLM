@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from logging import getLogger
 
+import codecs
 
 logger = getLogger()
 
@@ -132,7 +133,7 @@ class Dictionary(object):
         for i in range(SPECIAL_WORDS):
             word2id[SPECIAL_WORD % i] = 4 + i
         counts = {k: 0 for k in word2id.keys()}
-        f = open(vocab_path, 'r', encoding='utf-8')
+        f = codecs.open(vocab_path, 'r', encoding='utf-8', errors='ignore')
         for i, line in enumerate(f):
             if '\u2028' in line:
                 skipped += 1
@@ -178,7 +179,7 @@ class Dictionary(object):
         unk_words = {}
 
         # index sentences
-        f = open(path, 'r', encoding='utf-8')
+        f = codecs.open(path, 'r', encoding='utf-8', errors='ignore')
         for i, line in enumerate(f):
             if i % 1000000 == 0 and i > 0:
                 print(i)

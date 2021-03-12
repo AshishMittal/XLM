@@ -9,9 +9,144 @@ from logging import getLogger
 import math
 import numpy as np
 import torch
+import os
 
+from .dictionary import BOS_WORD, EOS_WORD, PAD_WORD, UNK_WORD, MASK_WORD
 
 logger = getLogger()
+
+
+def process_binarized(data, params):
+    """
+    Process a binarized dataset and log main statistics.
+    """
+    dico = data['dico']
+    assert ((data['sentences'].dtype == np.uint16) and (len(dico) < 1 << 16) or
+            (data['sentences'].dtype == np.int32) and (1 << 16 <= len(dico) < 1 << 31))
+    logger.info("%i words (%i unique) in %i sentences. %i unknown words (%i unique) covering %.2f%% of the data." % (
+        len(data['sentences']) - len(data['positions']),
+        len(dico), len(data['positions']),
+        sum(data['unk_words'].values()), len(data['unk_words']),
+        100. * sum(data['unk_words'].values()) / (len(data['sentences']) - len(data['positions']))
+    ))
+    if params.max_vocab != -1:
+        assert params.max_vocab > 0
+        logger.info("Selecting %i most frequent words ..." % params.max_vocab)
+        dico.max_vocab(params.max_vocab)
+        data['sentences'][data['sentences'] >= params.max_vocab] = dico.index(UNK_WORD)
+        unk_count = (data['sentences'] == dico.index(UNK_WORD)).sum()
+        logger.info("Now %i unknown words covering %.2f%% of the data."
+                    % (unk_count, 100. * unk_count / (len(data['sentences']) - len(data['positions']))))
+    if params.min_count > 0:
+        logger.info("Selecting words with >= %i occurrences ..." % params.min_count)
+        dico.min_count(params.min_count)
+        data['sentences'][data['sentences'] >= len(dico)] = dico.index(UNK_WORD)
+        unk_count = (data['sentences'] == dico.index(UNK_WORD)).sum()
+        logger.info("Now %i unknown words covering %.2f%% of the data."
+                    % (unk_count, 100. * unk_count / (len(data['sentences']) - len(data['positions']))))
+    if (data['sentences'].dtype == np.int32) and (len(dico) < 1 << 16):
+        logger.info("Less than 65536 words. Moving data from int32 to uint16 ...")
+        data['sentences'] = data['sentences'].astype(np.uint16)
+    return data
+
+
+def load_binarized(path, params):
+    """
+    Load a binarized dataset.
+    """
+    assert path.endswith('.pth')
+    if params.debug_train:
+        path = path.replace('train', 'valid')
+    if getattr(params, 'multi_gpu', False):
+        split_path = '%s.%i.pth' % (path[:-4], params.local_rank)
+        if os.path.isfile(split_path):
+            assert params.split_data is False
+            path = split_path
+    assert os.path.isfile(path), path
+    logger.info("Loading data from %s ..." % path)
+    data = torch.load(path)
+    data = process_binarized(data, params)
+    return data
+
+
+class StreamMultiFilesDataset(object):
+
+    def __init__(self, paths, bs, params):
+        """
+        Prepare batches for data iterator.
+        """
+        self.paths = paths
+        self.bs = bs
+        self.params = params
+        self.index = 0
+
+        self.get_next_chunk()
+
+
+    def get_next_chunk(self):
+
+        if self.index == len(self.paths):
+            self.index = 0
+
+        data = load_binarized(self.paths[self.index], self.params)
+        sent = data["sentences"]
+        pos = data["positions"]
+
+        bptt = self.params.bptt
+        self.eos = data['dico'].index(EOS_WORD)
+
+        # checks
+        assert len(pos) == (sent == self.eos).sum()
+        assert len(pos) == (sent[pos[:, 1]] == self.eos).sum()
+
+        n_tokens = len(sent)
+        n_batches = math.ceil(n_tokens / (self.bs * bptt))
+        t_size = n_batches * bptt * self.bs
+
+        buffer = np.zeros(t_size, dtype=sent.dtype) + self.eos
+        buffer[t_size - n_tokens:] = sent
+        buffer = buffer.reshape((self.bs, n_batches * bptt)).T
+        self.data = np.zeros((n_batches * bptt + 1, self.bs), dtype=sent.dtype) + self.eos
+        self.data[1:] = buffer
+
+        self.bptt = bptt
+        self.n_tokens = n_tokens
+        self.n_batches = n_batches
+        self.n_sentences = len(pos)
+        self.lengths = torch.LongTensor(self.bs).fill_(bptt)
+
+        self.index += 1
+
+    def __len__(self):
+        """
+        Number of sentences in the dataset.
+        """
+        return self.n_sentences
+
+    def select_data(self, a, b):
+        """
+        Only select a subset of the dataset.
+        """
+        if not (0 <= a < b <= self.n_batches):
+            logger.warning("Invalid split values: %i %i - %i" % (a, b, self.n_batches))
+            return
+        assert 0 <= a < b <= self.n_batches
+        logger.info("Selecting batches from %i to %i ..." % (a, b))
+
+        # sub-select
+        self.data = self.data[a * self.bptt:b * self.bptt]
+        self.n_batches = b - a
+        self.n_sentences = (self.data == self.eos).sum().item()
+
+    def get_iterator(self, shuffle, subsample=1):
+        """
+        Return a sentences iterator.
+        """
+        indexes = (np.random.permutation if shuffle else range)(self.n_batches // subsample)
+        for i in indexes:
+            a = self.bptt * i
+            b = self.bptt * (i + 1)
+            yield torch.from_numpy(self.data[a:b].astype(np.int64)), self.lengths
 
 
 class StreamDataset(object):

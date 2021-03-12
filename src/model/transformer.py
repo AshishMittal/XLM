@@ -40,22 +40,78 @@ TRANSFORMER_LAYER_PARAMS = [
 
 logger = getLogger()
 
+def extract_top_level_dict(current_dict):
+    if current_dict is None: return None
 
-def Embedding(num_embeddings, embedding_dim, padding_idx=None):
-    m = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)
-    nn.init.normal_(m.weight, mean=0, std=embedding_dim ** -0.5)
-    if padding_idx is not None:
-        nn.init.constant_(m.weight[padding_idx], 0)
-    return m
+    output_dict = dict()
+    for key in current_dict.keys():
+        top_level = key.split(".")[0]
+        sub_level = ".".join(key.split(".")[1:])
+
+        if top_level not in output_dict:
+            if sub_level == "":
+                output_dict[top_level] = current_dict[key]
+            else:
+                output_dict[top_level] = {sub_level: current_dict[key]}
+        else:
+            new_item = {key: value for key, value in output_dict[top_level].items()}
+            new_item[sub_level] = current_dict[key]
+            output_dict[top_level] = new_item
+
+    return output_dict
+
+class Embedding(nn.Embedding):
+    def __init__(self, num_embeddings, embedding_dim, padding_idx=None):
+        super(Embedding, self).__init__(num_embeddings, embedding_dim, padding_idx=padding_idx)
+
+        nn.init.normal_(self.weight, mean=0, std=embedding_dim ** -0.5)
+        if padding_idx is not None:
+            nn.init.constant_(self.weight[padding_idx], 0)
+
+    def forward(self, input, params=None):
+
+        if params is not None:
+            weight = params["weight"]
+        else:
+            weight = self.weight
+
+        return F.embedding(
+            input, weight, self.padding_idx, self.max_norm,
+            self.norm_type, self.scale_grad_by_freq, self.sparse)
 
 
-def Linear(in_features, out_features, bias=True):
-    m = nn.Linear(in_features, out_features, bias)
-    # nn.init.normal_(m.weight, mean=0, std=1)
-    # nn.init.xavier_uniform_(m.weight)
-    # nn.init.constant_(m.bias, 0.)
-    return m
+class Linear(nn.Linear):
 
+    def __init__(self, in_features, out_features, bias=True):
+        super(Linear, self).__init__(in_features, out_features, bias)
+
+    def forward(self, input, params=None):
+
+        if params is not None:
+            weight = params["weight"]
+            bias = params["bias"]
+        else:
+            weight = self.weight
+            bias = self.bias
+
+        return F.linear(input, weight, bias)
+
+class LayerNorm(nn.LayerNorm):
+
+    def __init__(self, normalized_shape, eps=1e-5, elementwise_affine=True):
+        super(LayerNorm, self).__init__(normalized_shape=normalized_shape, eps=eps, elementwise_affine=elementwise_affine)
+
+    def forward(self, input, params=None):
+
+        if params is not None:
+            weight = params["weight"]
+            bias = params["bias"]
+        else:
+            weight = self.weight
+            bias = self.bias
+
+        return F.layer_norm(
+            input, self.normalized_shape, weight, bias, self.eps)
 
 def create_sinusoidal_embeddings(n_pos, dim, out):
     position_enc = np.array([
@@ -123,14 +179,17 @@ class PredLayer(nn.Module):
                 head_bias=True,  # default is False
             )
 
-    def forward(self, x, y, get_scores=False):
+    def forward(self, x, y, get_scores=False, params=None):
         """
         Compute the loss, and optionally the scores.
         """
         assert (y == self.pad_index).sum().item() == 0
 
         if self.asm is False:
-            scores = self.proj(x).view(-1, self.n_words)
+            if params is not None and 'proj' in params:
+                scores = self.proj(x, extract_top_level_dict(params['proj'])).view(-1, self.n_words)
+            else:
+                scores = self.proj(x).view(-1, self.n_words)
             loss = F.cross_entropy(scores, y, reduction='mean')
         else:
             _, loss = self.proj(x, y)
@@ -163,7 +222,7 @@ class MultiHeadAttention(nn.Module):
         self.v_lin = Linear(dim, dim)
         self.out_lin = Linear(dim, dim)
 
-    def forward(self, input, mask, kv=None, cache=None):
+    def forward(self, input, mask, kv=None, cache=None, params=None):
         """
         Self-attention (if kv is None) or attention over source sentence (provided by kv).
         """
@@ -187,14 +246,32 @@ class MultiHeadAttention(nn.Module):
             """  compute context """
             return x.transpose(1, 2).contiguous().view(bs, -1, self.n_heads * dim_per_head)
 
-        q = shape(self.q_lin(input))                                          # (bs, n_heads, qlen, dim_per_head)
+        if params is not None and 'q_lin' in params:
+            q = shape(self.q_lin(input, extract_top_level_dict(params['q_lin'])))
+        else:
+            q = shape(self.q_lin(input))                                          # (bs, n_heads, qlen, dim_per_head)
+
+
         if kv is None:
-            k = shape(self.k_lin(input))                                      # (bs, n_heads, qlen, dim_per_head)
-            v = shape(self.v_lin(input))                                      # (bs, n_heads, qlen, dim_per_head)
+            if params is not None and 'k_lin' in params:
+                k = shape(self.k_lin(input, extract_top_level_dict(params['k_lin'])))
+            else:
+                k = shape(self.k_lin(input))                                      # (bs, n_heads, qlen, dim_per_head)
+            if params is not None and 'v_lin' in params:
+                v = shape(self.v_lin(input, extract_top_level_dict(params['v_lin'])))
+            else:
+                v = shape(self.v_lin(input))                                      # (bs, n_heads, qlen, dim_per_head)
         elif cache is None or self.layer_id not in cache:
             k = v = kv
-            k = shape(self.k_lin(k))                                          # (bs, n_heads, qlen, dim_per_head)
-            v = shape(self.v_lin(v))                                          # (bs, n_heads, qlen, dim_per_head)
+
+            if params is not None and 'k_lin' in params:
+                k = shape(self.k_lin(k, extract_top_level_dict(params['k_lin'])))
+            else:
+                k = shape(self.k_lin(k))                                      # (bs, n_heads, qlen, dim_per_head)
+            if params is not None and 'v_lin' in params:
+                v = shape(self.v_lin(v, extract_top_level_dict(params['v_lin'])))
+            else:
+                v = shape(self.v_lin(v))                                      # (bs, n_heads, qlen, dim_per_head)
 
         if cache is not None:
             if self.layer_id in cache:
@@ -216,7 +293,12 @@ class MultiHeadAttention(nn.Module):
         context = torch.matmul(weights, v)                                    # (bs, n_heads, qlen, dim_per_head)
         context = unshape(context)                                            # (bs, qlen, dim)
 
-        return self.out_lin(context)
+        if params is not None and 'out_lin' in params:
+            context = self.out_lin(context, extract_top_level_dict(params['out_lin']))
+        else:
+            context = self.out_lin(context)
+
+        return context
 
 
 class TransformerFFN(nn.Module):
@@ -228,10 +310,19 @@ class TransformerFFN(nn.Module):
         self.lin2 = Linear(dim_hidden, out_dim)
         self.act = gelu if gelu_activation else F.relu
 
-    def forward(self, input):
-        x = self.lin1(input)
+    def forward(self, input, params=None):
+
+        if params is not None and 'lin1' in params:
+            x = self.lin1(input, extract_top_level_dict(params['lin1']))
+        else:
+            x = self.lin1(input)
+
         x = self.act(x)
-        x = self.lin2(x)
+
+        if params is not None and 'lin2' in params:
+            x = self.lin2(x, extract_top_level_dict(params['lin2']))
+        else:
+            x = self.lin2(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
         return x
 
@@ -250,6 +341,12 @@ class TransformerModel(nn.Module):
         self.is_encoder = is_encoder
         self.is_decoder = not is_encoder
         self.with_output = with_output
+
+        # lang specific params
+        self.lang_specific_LN = params.lang_specific_LN
+        self.lang_specific_FFN = params.lang_specific_FFN
+        self.lang_specific_ATTN = params.lang_specific_ATTN
+        self.lang_specific_ADPT = params.lang_specific_ADPT
 
         # dictionary / languages
         self.n_langs = params.n_langs
@@ -270,25 +367,60 @@ class TransformerModel(nn.Module):
         self.n_layers = params.n_layers
         self.dropout = params.dropout
         self.attention_dropout = params.attention_dropout
+        if self.lang_specific_ADPT:
+            self.ADPT_dim = params.ADPT_dim
         assert self.dim % self.n_heads == 0, 'transformer dim must be a multiple of n_heads'
 
         # embeddings
         self.position_embeddings = Embedding(N_MAX_POSITIONS, self.dim)
-        if params.sinusoidal_embeddings:
-            create_sinusoidal_embeddings(N_MAX_POSITIONS, self.dim, out=self.position_embeddings.weight)
         if params.n_langs > 1 and self.use_lang_emb:
             self.lang_embeddings = Embedding(self.n_langs, self.dim)
         self.embeddings = Embedding(self.n_words, self.dim, padding_idx=self.pad_index)
-        self.layer_norm_emb = nn.LayerNorm(self.dim, eps=1e-12)
+
+        if self.n_langs > 1 and self.lang_specific_LN:
+            self.layer_norm_emb = nn.ModuleDict()
+            for lg in self.lang2id:
+                self.layer_norm_emb[lg] = LayerNorm(self.dim, eps=1e-12)
+        else:
+            self.layer_norm_emb = LayerNorm(self.dim, eps=1e-12)
 
         # transformer layers
-        self.attentions = nn.ModuleList()
-        self.layer_norm1 = nn.ModuleList()
-        self.ffns = nn.ModuleList()
-        self.layer_norm2 = nn.ModuleList()
-        if self.is_decoder:
-            self.layer_norm15 = nn.ModuleList()
-            self.encoder_attn = nn.ModuleList()
+        if self.n_langs > 1 and self.lang_specific_ATTN:
+            self.attentions = nn.ModuleDict()
+            for lg in self.lang2id:
+                self.attentions[lg] = nn.ModuleList()
+        else:
+            self.attentions = nn.ModuleList()
+
+        if self.n_langs > 1 and self.lang_specific_FFN:
+            self.ffns = nn.ModuleDict()
+            for lg in self.lang2id:
+                self.ffns[lg] = nn.ModuleList()
+        else:
+            self.ffns = nn.ModuleList()
+
+        if self.n_langs > 1 and self.lang_specific_LN:
+            self.layer_norm1 = nn.ModuleDict()
+            for lg in self.lang2id:
+                self.layer_norm1[lg] = nn.ModuleList()
+        else:
+            self.layer_norm1 = nn.ModuleList()
+
+        if self.n_langs > 1 and self.lang_specific_LN:
+            self.layer_norm2 = nn.ModuleDict()
+            for lg in self.lang2id:
+                self.layer_norm2[lg] = nn.ModuleList()
+        else:
+            self.layer_norm2 = nn.ModuleList()
+
+        if self.lang_specific_ADPT:
+            self.adapter1 = nn.ModuleDict()
+            for lg in self.lang2id:
+                self.adapter1[lg] = nn.ModuleList()
+
+            self.adapter2 = nn.ModuleDict()
+            for lg in self.lang2id:
+                self.adapter2[lg] = nn.ModuleList()
 
         # memories
         self.memories = nn.ModuleDict()
@@ -300,16 +432,37 @@ class TransformerModel(nn.Module):
                 self.memories['%i_%s' % (layer_id, pos)] = HashingMemory.build(self.dim, self.dim, params)
 
         for layer_id in range(self.n_layers):
-            self.attentions.append(MultiHeadAttention(self.n_heads, self.dim, dropout=self.attention_dropout))
-            self.layer_norm1.append(nn.LayerNorm(self.dim, eps=1e-12))
+            if self.n_langs > 1 and self.lang_specific_ATTN:
+                for lg in self.lang2id:
+                    self.attentions[lg].append(MultiHeadAttention(self.n_heads, self.dim, dropout=self.attention_dropout))
+            else:
+                self.attentions.append(MultiHeadAttention(self.n_heads, self.dim, dropout=self.attention_dropout))
+
+            if self.lang_specific_LN:
+                for lg in self.lang2id:
+                    self.layer_norm1[lg].append(LayerNorm(self.dim, eps=1e-12))
+            else:
+                self.layer_norm1.append(LayerNorm(self.dim, eps=1e-12))
             if self.is_decoder:
-                self.layer_norm15.append(nn.LayerNorm(self.dim, eps=1e-12))
+                self.layer_norm15.append(LayerNorm(self.dim, eps=1e-12))
                 self.encoder_attn.append(MultiHeadAttention(self.n_heads, self.dim, dropout=self.attention_dropout))
-            if ('%i_in' % layer_id) in self.memories:
-                self.ffns.append(None)
+
+            if self.n_langs > 1 and self.lang_specific_FFN:
+                for lg in self.lang2id:
+                    self.ffns[lg].append(TransformerFFN(self.dim, self.hidden_dim, self.dim, dropout=self.dropout, gelu_activation=params.gelu_activation))
             else:
                 self.ffns.append(TransformerFFN(self.dim, self.hidden_dim, self.dim, dropout=self.dropout, gelu_activation=params.gelu_activation))
-            self.layer_norm2.append(nn.LayerNorm(self.dim, eps=1e-12))
+
+            if self.lang_specific_LN:
+                for lg in self.lang2id:
+                    self.layer_norm2[lg].append(LayerNorm(self.dim, eps=1e-12))
+            else:
+                self.layer_norm2.append(LayerNorm(self.dim, eps=1e-12))
+
+            if self.lang_specific_ADPT:
+                for lg in self.lang2id:
+                    self.adapter1[lg].append(TransformerFFN(self.dim, self.ADPT_dim, self.dim, dropout=self.dropout, gelu_activation=params.gelu_activation))
+                    self.adapter2[lg].append(TransformerFFN(self.dim, self.ADPT_dim, self.dim, dropout=self.dropout, gelu_activation=params.gelu_activation))
 
         # output layer
         if self.with_output:
@@ -329,7 +482,7 @@ class TransformerModel(nn.Module):
         else:
             raise Exception("Unknown mode: %s" % mode)
 
-    def fwd(self, x, lengths, causal, src_enc=None, src_len=None, positions=None, langs=None, cache=None):
+    def fwd(self, x, lengths, causal, src_enc=None, src_len=None, positions=None, langs=None, cache=None, lang=None, params=None):
         """
         Inputs:
             `x` LongTensor(slen, bs), containing word indices
@@ -338,8 +491,6 @@ class TransformerModel(nn.Module):
             `positions` LongTensor(slen, bs), containing word positions
             `langs` LongTensor(slen, bs), containing language IDs
         """
-        # lengths = (x != self.pad_index).float().sum(dim=1)
-        # mask = x != self.pad_index
 
         # check inputs
         slen, bs = x.size()
@@ -369,52 +520,153 @@ class TransformerModel(nn.Module):
             assert langs.size() == (slen, bs)
             langs = langs.transpose(0, 1)
 
-        # do not recompute cached elements
-        if cache is not None:
-            _slen = slen - cache['slen']
-            x = x[:, -_slen:]
-            positions = positions[:, -_slen:]
-            if langs is not None:
-                langs = langs[:, -_slen:]
-            mask = mask[:, -_slen:]
-            attn_mask = attn_mask[:, -_slen:]
+        # Second order params
+        if params is not None:
+            param_dict = extract_top_level_dict(params)
 
         # embeddings
-        tensor = self.embeddings(x)
-        tensor = tensor + self.position_embeddings(positions).expand_as(tensor)
+        if params is not None and 'embeddings' in param_dict:
+            tensor = self.embeddings(x, param_dict['embeddings'])
+        else:
+            tensor = self.embeddings(x)
+
+        if params is not None and 'position_embeddings' in param_dict:
+            tensor = tensor + self.position_embeddings(positions, param_dict['position_embeddings']).expand_as(tensor)
+        else:
+            tensor = tensor + self.position_embeddings(positions).expand_as(tensor)
+
         if langs is not None and self.use_lang_emb:
-            tensor = tensor + self.lang_embeddings(langs)
-        tensor = self.layer_norm_emb(tensor)
+            if params is not None and 'lang_embeddings' in param_dict:
+                tensor = tensor + self.lang_embeddings(langs, param_dict['lang_embeddings'])
+            else:
+                tensor = tensor + self.lang_embeddings(langs)
+
+        if self.n_langs > 1 and self.lang_specific_LN:
+            assert lang is not None
+            if params is not None and 'layer_norm_emb' in param_dict:
+                lang_spec_layer_norm_param = extract_top_level_dict(param_dict['layer_norm_emb'])
+                tensor = self.layer_norm_emb[lang](tensor, lang_spec_layer_norm_param[lang])
+            else:
+                tensor = self.layer_norm_emb[lang](tensor)
+        else:
+            if params is not None and 'layer_norm_emb' in param_dict:
+                tensor = self.layer_norm_emb(tensor, param_dict['layer_norm_emb'])
+            else:
+                tensor = self.layer_norm_emb(tensor)
         tensor = F.dropout(tensor, p=self.dropout, training=self.training)
         tensor *= mask.unsqueeze(-1).to(tensor.dtype)
+
+        # For any feed in parameter
+        attn_param = None
+        if params is not None and 'attentions' in param_dict:
+            if self.n_langs > 1 and self.lang_specific_ATTN:
+                attn_param = {k: extract_top_level_dict(v) for k, v in
+                             extract_top_level_dict(param_dict['attentions']).items()}
+            else:
+                attn_param = extract_top_level_dict(param_dict['attentions'])
+
+        ffn_param = None
+        if params is not None and 'ffns' in param_dict:
+            if self.n_langs > 1 and self.lang_specific_FFN:
+                ffn_param = {k: extract_top_level_dict(v) for k, v in
+                             extract_top_level_dict(param_dict['ffns']).items()}
+            else:
+                ffn_param = extract_top_level_dict(param_dict['ffns'])
+
+        adpt1_param = None
+        if params is not None and 'adapter1' in param_dict:
+            adpt1_param = {k: extract_top_level_dict(v) for k, v in
+                         extract_top_level_dict(param_dict['adapter1']).items()}
+
+
+        adpt2_param = None
+        if params is not None and 'adapter2' in param_dict:
+            adpt2_param = {k: extract_top_level_dict(v) for k, v in
+                           extract_top_level_dict(param_dict['adapter2']).items()}
+
+        ln1_param = None
+        if params is not None and 'layer_norm1' in param_dict:
+            if self.n_langs > 1 and self.lang_specific_LN:
+                ln1_param = {k: extract_top_level_dict(v) for k, v in
+                               extract_top_level_dict(param_dict['layer_norm1']).items()}
+            else:
+                ln1_param = extract_top_level_dict(param_dict['layer_norm1'])
+
+        ln2_param = None
+        if params is not None and 'layer_norm2' in param_dict:
+            if self.n_langs > 1 and self.lang_specific_LN:
+                ln2_param = {k: extract_top_level_dict(v) for k, v in
+                             extract_top_level_dict(param_dict['layer_norm2']).items()}
+            else:
+                ln2_param = extract_top_level_dict(param_dict['layer_norm2'])
 
         # transformer layers
         for i in range(self.n_layers):
 
             # self attention
-            attn = self.attentions[i](tensor, attn_mask, cache=cache)
+            if self.n_langs > 1 and self.lang_specific_ATTN:
+                if attn_param is not None:
+                    attn = self.attentions[lang][i](tensor, attn_mask, cache=cache, params=extract_top_level_dict(attn_param[lang][str(i)]))
+                else:
+                    attn = self.attentions[lang][i](tensor, attn_mask, cache=cache)
+            else:
+                if attn_param is not None:
+                    attn = self.attentions[i](tensor, attn_mask, cache=cache, params=extract_top_level_dict(attn_param[str(i)]))
+                else:
+                    attn = self.attentions[i](tensor, attn_mask, cache=cache)
             attn = F.dropout(attn, p=self.dropout, training=self.training)
-            tensor = tensor + attn
-            tensor = self.layer_norm1[i](tensor)
 
-            # encoder attention (for decoder only)
-            if self.is_decoder and src_enc is not None:
-                attn = self.encoder_attn[i](tensor, src_mask, kv=src_enc, cache=cache)
-                attn = F.dropout(attn, p=self.dropout, training=self.training)
-                tensor = tensor + attn
-                tensor = self.layer_norm15[i](tensor)
+            # Adapter
+            if self.lang_specific_ADPT:
+                if adpt1_param is not None:
+                    attn = attn + self.adapter1[lang][i](attn, extract_top_level_dict(adpt1_param[lang][str(i)]))
+                else:
+                    attn = attn + self.adapter1[lang][i](attn)
+
+            tensor = tensor + attn
+
+            if self.lang_specific_LN:
+                if ln1_param is not None:
+                    tensor = self.layer_norm1[lang][i](tensor, extract_top_level_dict(ln1_param[lang][str(i)]))
+                else:
+                    tensor = self.layer_norm1[lang][i](tensor)
+            else:
+                if ln1_param is not None:
+                    tensor = self.layer_norm1[i](tensor, extract_top_level_dict(ln1_param[str(i)]))
+                else:
+                    tensor = self.layer_norm1[i](tensor)
 
             # FFN
-            if ('%i_in' % i) in self.memories:
-                tensor = tensor + self.memories['%i_in' % i](tensor)
+            if self.n_langs > 1 and self.lang_specific_FFN:
+                if ffn_param is not None:
+                    ffn = self.ffns[lang][i](tensor, extract_top_level_dict(ffn_param[lang][str(i)]))
+                else:
+                    ffn = self.ffns[lang][i](tensor)
             else:
-                tensor = tensor + self.ffns[i](tensor)
-            tensor = self.layer_norm2[i](tensor)
+                if ffn_param is not None:
+                    ffn = self.ffns[i](tensor, extract_top_level_dict(ffn_param[str(i)]))
+                else:
+                    ffn = self.ffns[i](tensor)
 
-            # memory
-            if ('%i_after' % i) in self.memories:
-                tensor = tensor + self.memories['%i_after' % i](tensor)
-            # TODO: add extra layer norm here?
+            # Adapter
+            if self.lang_specific_ADPT:
+                if adpt2_param is not None:
+                    ffn = ffn + self.adapter2[lang][i](ffn, extract_top_level_dict(adpt2_param[lang][str(i)]))
+                else:
+                    ffn = ffn + self.adapter2[lang][i](ffn)
+
+            tensor = tensor + ffn
+
+            if self.lang_specific_LN:
+                if ln2_param is not None:
+                    tensor = self.layer_norm2[lang][i](tensor, extract_top_level_dict(ln2_param[lang][str(i)]))
+                else:
+                    tensor = self.layer_norm2[lang][i](tensor)
+            else:
+                if ln2_param is not None:
+                    tensor = self.layer_norm2[i](tensor, extract_top_level_dict(ln2_param[str(i)]))
+                else:
+                    tensor = self.layer_norm2[i](tensor)
 
             tensor *= mask.unsqueeze(-1).to(tensor.dtype)
 
@@ -427,7 +679,7 @@ class TransformerModel(nn.Module):
 
         return tensor
 
-    def predict(self, tensor, pred_mask, y, get_scores):
+    def predict(self, tensor, pred_mask, y, get_scores, params=None):
         """
         Given the last hidden state, compute word scores and/or the loss.
             `pred_mask` is a ByteTensor of shape (slen, bs), filled with 1 when
@@ -436,313 +688,12 @@ class TransformerModel(nn.Module):
             `get_scores` is a boolean specifying whether we need to return scores
         """
         masked_tensor = tensor[pred_mask.unsqueeze(-1).expand_as(tensor)].view(-1, self.dim)
-        scores, loss = self.pred_layer(masked_tensor, y, get_scores)
-        return scores, loss
 
-    def generate(self, src_enc, src_len, tgt_lang_id, max_len=200, sample_temperature=None):
-        """
-        Decode a sentence given initial start.
-        `x`:
-            - LongTensor(bs, slen)
-                <EOS> W1 W2 W3 <EOS> <PAD>
-                <EOS> W1 W2 W3   W4  <EOS>
-        `lengths`:
-            - LongTensor(bs) [5, 6]
-        `positions`:
-            - False, for regular "arange" positions (LM)
-            - True, to reset positions from the new generation (MT)
-        `langs`:
-            - must be None if the model only supports one language
-            - lang_id if only one language is involved (LM)
-            - (lang_id1, lang_id2) if two languages are involved (MT)
-        """
+        if params is not None:
+            param_dict = extract_top_level_dict(params)
 
-        # input batch
-        bs = len(src_len)
-        assert src_enc.size(0) == bs
-
-        # generated sentences
-        generated = src_len.new(max_len, bs)  # upcoming output
-        generated.fill_(self.pad_index)       # fill upcoming ouput with <PAD>
-        generated[0].fill_(self.eos_index)    # we use <EOS> for <BOS> everywhere
-
-        # positions
-        positions = src_len.new(max_len).long()
-        positions = torch.arange(max_len, out=positions).unsqueeze(1).expand(max_len, bs)
-
-        # language IDs
-        langs = src_len.new(max_len).long().fill_(tgt_lang_id)
-        langs = langs.unsqueeze(1).expand(max_len, bs)
-
-        # current position / max lengths / length of generated sentences / unfinished sentences
-        cur_len = 1
-        gen_len = src_len.clone().fill_(1)
-        unfinished_sents = src_len.clone().fill_(1)
-
-        # cache compute states
-        cache = {'slen': 0}
-
-        while cur_len < max_len:
-
-            # compute word scores
-            tensor = self.forward(
-                'fwd',
-                x=generated[:cur_len],
-                lengths=gen_len,
-                positions=positions[:cur_len],
-                langs=langs[:cur_len],
-                causal=True,
-                src_enc=src_enc,
-                src_len=src_len,
-                cache=cache
-            )
-            assert tensor.size() == (1, bs, self.dim), (cur_len, max_len, src_enc.size(), tensor.size(), (1, bs, self.dim))
-            tensor = tensor.data[-1, :, :].type_as(src_enc)  # (bs, dim)
-            scores = self.pred_layer.get_scores(tensor)      # (bs, n_words)
-
-            # select next words: sample or greedy
-            if sample_temperature is None:
-                next_words = torch.topk(scores, 1)[1].squeeze(1)
-            else:
-                next_words = torch.multinomial(F.softmax(scores / sample_temperature, dim=1), 1).squeeze(1)
-            assert next_words.size() == (bs,)
-
-            # update generations / lengths / finished sentences / current length
-            generated[cur_len] = next_words * unfinished_sents + self.pad_index * (1 - unfinished_sents)
-            gen_len.add_(unfinished_sents)
-            unfinished_sents.mul_(next_words.ne(self.eos_index).long())
-            cur_len = cur_len + 1
-
-            # stop when there is a </s> in each sentence, or if we exceed the maximul length
-            if unfinished_sents.max() == 0:
-                break
-
-        # add <EOS> to unfinished sentences
-        if cur_len == max_len:
-            generated[-1].masked_fill_(unfinished_sents.byte(), self.eos_index)
-
-        # sanity check
-        assert (generated == self.eos_index).sum() == 2 * bs
-
-        return generated[:cur_len], gen_len
-
-    def generate_beam(self, src_enc, src_len, tgt_lang_id, beam_size, length_penalty, early_stopping, max_len=200):
-        """
-        Decode a sentence given initial start.
-        `x`:
-            - LongTensor(bs, slen)
-                <EOS> W1 W2 W3 <EOS> <PAD>
-                <EOS> W1 W2 W3   W4  <EOS>
-        `lengths`:
-            - LongTensor(bs) [5, 6]
-        `positions`:
-            - False, for regular "arange" positions (LM)
-            - True, to reset positions from the new generation (MT)
-        `langs`:
-            - must be None if the model only supports one language
-            - lang_id if only one language is involved (LM)
-            - (lang_id1, lang_id2) if two languages are involved (MT)
-        """
-
-        # check inputs
-        assert src_enc.size(0) == src_len.size(0)
-        assert beam_size >= 1
-
-        # batch size / number of words
-        bs = len(src_len)
-        n_words = self.n_words
-
-        # expand to beam size the source latent representations / source lengths
-        src_enc = src_enc.unsqueeze(1).expand((bs, beam_size) + src_enc.shape[1:]).contiguous().view((bs * beam_size,) + src_enc.shape[1:])
-        src_len = src_len.unsqueeze(1).expand(bs, beam_size).contiguous().view(-1)
-
-        # generated sentences (batch with beam current hypotheses)
-        generated = src_len.new(max_len, bs * beam_size)  # upcoming output
-        generated.fill_(self.pad_index)                   # fill upcoming ouput with <PAD>
-        generated[0].fill_(self.eos_index)                # we use <EOS> for <BOS> everywhere
-
-        # generated hypotheses
-        generated_hyps = [BeamHypotheses(beam_size, max_len, length_penalty, early_stopping) for _ in range(bs)]
-
-        # positions
-        positions = src_len.new(max_len).long()
-        positions = torch.arange(max_len, out=positions).unsqueeze(1).expand_as(generated)
-
-        # language IDs
-        langs = positions.clone().fill_(tgt_lang_id)
-
-        # scores for each sentence in the beam
-        beam_scores = src_enc.new(bs, beam_size).fill_(0)
-        beam_scores[:, 1:] = -1e9
-        beam_scores = beam_scores.view(-1)
-
-        # current position
-        cur_len = 1
-
-        # cache compute states
-        cache = {'slen': 0}
-
-        # done sentences
-        done = [False for _ in range(bs)]
-
-        while cur_len < max_len:
-
-            # compute word scores
-            tensor = self.forward(
-                'fwd',
-                x=generated[:cur_len],
-                lengths=src_len.new(bs * beam_size).fill_(cur_len),
-                positions=positions[:cur_len],
-                langs=langs[:cur_len],
-                causal=True,
-                src_enc=src_enc,
-                src_len=src_len,
-                cache=cache
-            )
-            assert tensor.size() == (1, bs * beam_size, self.dim)
-            tensor = tensor.data[-1, :, :]               # (bs * beam_size, dim)
-            scores = self.pred_layer.get_scores(tensor)  # (bs * beam_size, n_words)
-            scores = F.log_softmax(scores, dim=-1)       # (bs * beam_size, n_words)
-            assert scores.size() == (bs * beam_size, n_words)
-
-            # select next words with scores
-            _scores = scores + beam_scores[:, None].expand_as(scores)  # (bs * beam_size, n_words)
-            _scores = _scores.view(bs, beam_size * n_words)            # (bs, beam_size * n_words)
-
-            next_scores, next_words = torch.topk(_scores, 2 * beam_size, dim=1, largest=True, sorted=True)
-            assert next_scores.size() == next_words.size() == (bs, 2 * beam_size)
-
-            # next batch beam content
-            # list of (bs * beam_size) tuple(next hypothesis score, next word, current position in the batch)
-            next_batch_beam = []
-
-            # for each sentence
-            for sent_id in range(bs):
-
-                # if we are done with this sentence
-                done[sent_id] = done[sent_id] or generated_hyps[sent_id].is_done(next_scores[sent_id].max().item())
-                if done[sent_id]:
-                    next_batch_beam.extend([(0, self.pad_index, 0)] * beam_size)  # pad the batch
-                    continue
-
-                # next sentence beam content
-                next_sent_beam = []
-
-                # next words for this sentence
-                for idx, value in zip(next_words[sent_id], next_scores[sent_id]):
-
-                    # get beam and word IDs
-                    beam_id = idx // n_words
-                    word_id = idx % n_words
-
-                    # end of sentence, or next word
-                    if word_id == self.eos_index or cur_len + 1 == max_len:
-                        generated_hyps[sent_id].add(generated[:cur_len, sent_id * beam_size + beam_id].clone(), value.item())
-                    else:
-                        next_sent_beam.append((value, word_id, sent_id * beam_size + beam_id))
-
-                    # the beam for next step is full
-                    if len(next_sent_beam) == beam_size:
-                        break
-
-                # update next beam content
-                assert len(next_sent_beam) == 0 if cur_len + 1 == max_len else beam_size
-                if len(next_sent_beam) == 0:
-                    next_sent_beam = [(0, self.pad_index, 0)] * beam_size  # pad the batch
-                next_batch_beam.extend(next_sent_beam)
-                assert len(next_batch_beam) == beam_size * (sent_id + 1)
-
-            # sanity check / prepare next batch
-            assert len(next_batch_beam) == bs * beam_size
-            beam_scores = beam_scores.new([x[0] for x in next_batch_beam])
-            beam_words = generated.new([x[1] for x in next_batch_beam])
-            beam_idx = src_len.new([x[2] for x in next_batch_beam])
-
-            # re-order batch and internal states
-            generated = generated[:, beam_idx]
-            generated[cur_len] = beam_words
-            for k in cache.keys():
-                if k != 'slen':
-                    cache[k] = (cache[k][0][beam_idx], cache[k][1][beam_idx])
-
-            # update current length
-            cur_len = cur_len + 1
-
-            # stop when we are done with each sentence
-            if all(done):
-                break
-
-        # visualize hypotheses
-        # print([len(x) for x in generated_hyps], cur_len)
-        # globals().update( locals() );
-        # !import code; code.interact(local=vars())
-        # for ii in range(bs):
-        #     for ss, ww in sorted(generated_hyps[ii].hyp, key=lambda x: x[0], reverse=True):
-        #         print("%.3f " % ss + " ".join(self.dico[x] for x in ww.tolist()))
-        #     print("")
-
-        # select the best hypotheses
-        tgt_len = src_len.new(bs)
-        best = []
-
-        for i, hypotheses in enumerate(generated_hyps):
-            best_hyp = max(hypotheses.hyp, key=lambda x: x[0])[1]
-            tgt_len[i] = len(best_hyp) + 1  # +1 for the <EOS> symbol
-            best.append(best_hyp)
-
-        # generate target batch
-        decoded = src_len.new(tgt_len.max().item(), bs).fill_(self.pad_index)
-        for i, hypo in enumerate(best):
-            decoded[:tgt_len[i] - 1, i] = hypo
-            decoded[tgt_len[i] - 1, i] = self.eos_index
-
-        # sanity check
-        assert (decoded == self.eos_index).sum() == 2 * bs
-
-        return decoded, tgt_len
-
-
-class BeamHypotheses(object):
-
-    def __init__(self, n_hyp, max_len, length_penalty, early_stopping):
-        """
-        Initialize n-best list of hypotheses.
-        """
-        self.max_len = max_len - 1  # ignoring <BOS>
-        self.length_penalty = length_penalty
-        self.early_stopping = early_stopping
-        self.n_hyp = n_hyp
-        self.hyp = []
-        self.worst_score = 1e9
-
-    def __len__(self):
-        """
-        Number of hypotheses in the list.
-        """
-        return len(self.hyp)
-
-    def add(self, hyp, sum_logprobs):
-        """
-        Add a new hypothesis to the list.
-        """
-        score = sum_logprobs / len(hyp) ** self.length_penalty
-        if len(self) < self.n_hyp or score > self.worst_score:
-            self.hyp.append((score, hyp))
-            if len(self) > self.n_hyp:
-                sorted_scores = sorted([(s, idx) for idx, (s, _) in enumerate(self.hyp)])
-                del self.hyp[sorted_scores[0][1]]
-                self.worst_score = sorted_scores[1][0]
-            else:
-                self.worst_score = min(score, self.worst_score)
-
-    def is_done(self, best_sum_logprobs):
-        """
-        If there are enough hypotheses and that none of the hypotheses being generated
-        can become better than the worst one in the heap, then we are done with this sentence.
-        """
-        if len(self) < self.n_hyp:
-            return False
-        elif self.early_stopping:
-            return True
+        if params is not None and 'pred_layer' in param_dict:
+            scores, loss = self.pred_layer(masked_tensor, y, get_scores, params=extract_top_level_dict(param_dict['pred_layer']))
         else:
-            return self.worst_score >= best_sum_logprobs / self.max_len ** self.length_penalty
+            scores, loss = self.pred_layer(masked_tensor, y, get_scores)
+        return scores, loss

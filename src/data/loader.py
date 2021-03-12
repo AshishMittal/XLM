@@ -10,7 +10,7 @@ import os
 import numpy as np
 import torch
 
-from .dataset import StreamDataset, Dataset, ParallelDataset
+from .dataset import StreamDataset, Dataset, ParallelDataset, StreamMultiFilesDataset
 from .dictionary import BOS_WORD, EOS_WORD, PAD_WORD, UNK_WORD, MASK_WORD
 
 
@@ -122,13 +122,43 @@ def load_mono_data(params, data):
             if splt == 'train' and params.eval_only:
                 continue
 
-            # load data / update dictionary parameters / update data
-            mono_data = load_binarized(params.mono_dataset[lang][splt], params)
-            set_dico_parameters(params, data, mono_data['dico'])
+            if splt == 'train':
+                bs = params.batch_size
+            elif splt == 'valid':
+                bs = params.valid_max_batch_size
+            else:
+                bs = 1
 
+            # load data / update dictionary parameters / update data
             # create stream dataset
-            bs = params.batch_size if splt == 'train' else 1
-            data['mono_stream'][lang][splt] = StreamDataset(mono_data['sentences'], mono_data['positions'], bs, params)
+            if params.multiple_files and splt == 'train':
+                paths = []
+
+                all_files = os.listdir(params.data_path)
+                total = 0
+                for f in all_files:
+                    if lang in f and 'train' in f and 'pth' in f:
+                        total += 1
+                if params.multi_gpu:
+                    a = total // params.n_gpu_per_node
+                    i = a * params.local_rank
+                    j = a * (params.local_rank + 1)
+                    if params.local_rank == (params.n_gpu_per_node - 1):
+                        j = total
+                    paths = [os.path.join(params.data_path, 'train.' + lang + '.' + str(num) + '.pth') for num in
+                             range(i, j)]
+                else:
+                    paths = [os.path.join(params.data_path, 'train.' + lang + '.' + str(num) + '.pth') for num in
+                             range(total)]
+
+                logger.info('============ Paths (%s) %i %i' % (paths, params.n_gpu_per_node, params.local_rank))
+
+                data['mono_stream'][lang][splt] = StreamMultiFilesDataset(paths, bs, params)
+
+            else:
+                mono_data = load_binarized(params.mono_dataset[lang][splt], params)
+                set_dico_parameters(params, data, mono_data['dico'])
+                data['mono_stream'][lang][splt] = StreamDataset(mono_data['sentences'], mono_data['positions'], bs, params)
 
             # if there are several processes on the same machine, we can split the dataset
             if splt == 'train' and params.split_data and 1 < params.n_gpu_per_node <= data['mono_stream'][lang][splt].n_batches:
@@ -292,9 +322,9 @@ def check_data_params(params):
     }
     for paths in params.mono_dataset.values():
         for p in paths.values():
-            if not os.path.isfile(p):
+            if not os.path.isfile(p) and not params.multiple_files:
                 logger.error(f"{p} not found")
-    assert all([all([os.path.isfile(p) for p in paths.values()]) for paths in params.mono_dataset.values()])
+    # assert all([all([os.path.isfile(p) for p in paths.values()]) for paths in params.mono_dataset.values()])
 
     # check parallel datasets
     required_para_train = set(params.clm_steps + params.mlm_steps + params.pc_steps + params.mt_steps)
@@ -310,9 +340,9 @@ def check_data_params(params):
     }
     for paths in params.para_dataset.values():
         for p1, p2 in paths.values():
-            if not os.path.isfile(p1):
+            if not os.path.isfile(p1) and not params.multiple_files:
                 logger.error(f"{p1} not found")
-            if not os.path.isfile(p2):
+            if not os.path.isfile(p2) and not params.multiple_files:
                 logger.error(f"{p2} not found")
     assert all([all([os.path.isfile(p1) and os.path.isfile(p2) for p1, p2 in paths.values()]) for paths in params.para_dataset.values()])
 

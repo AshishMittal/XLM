@@ -203,7 +203,7 @@ class Evaluator(object):
             if not np.any(to_predict[:lengths[i] - 1, i]):
                 v = rng.randint(1, lengths[i] - 1)
                 to_predict[v, i] = 1
-        pred_mask = torch.from_numpy(to_predict.astype(np.uint8))
+        pred_mask = torch.from_numpy(to_predict.astype(np.bool))
 
         # generate possible targets / update x input
         _x_real = x[pred_mask]
@@ -372,7 +372,7 @@ class Evaluator(object):
             x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
 
             # forward / loss
-            tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
+            tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False, lang=lang1)
             word_scores, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=True)
 
             # update stats

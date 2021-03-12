@@ -17,6 +17,8 @@ from torch.nn import functional as F
 from torch.nn.utils import clip_grad_norm_
 import apex
 
+from scipy.spatial.distance import cosine
+
 from .optim import get_optimizer
 from .utils import to_cuda, concat_batches, find_modules
 from .utils import parse_lambda_config, update_lambdas
@@ -53,6 +55,8 @@ class Trainer(object):
 
         # set parameters
         self.set_parameters()
+        if params.do_meta_update:
+            self.set_shared_specific_parameters()
 
         # float16 / distributed (no AMP)
         assert params.amp >= 1 or not params.fp16
@@ -61,6 +65,9 @@ class Trainer(object):
             logger.info("Using nn.parallel.DistributedDataParallel ...")
             for name in self.MODEL_NAMES:
                 setattr(self, name, nn.parallel.DistributedDataParallel(getattr(self, name), device_ids=[params.local_rank], output_device=params.local_rank, broadcast_buffers=True))
+
+        if params.prune_test:
+            self.set_mask_parameters()
 
         # set optimizers
         self.set_optimizers()
@@ -72,6 +79,7 @@ class Trainer(object):
                 logger.info("Using apex.parallel.DistributedDataParallel ...")
                 for name in self.MODEL_NAMES:
                     setattr(self, name, apex.parallel.DistributedDataParallel(getattr(self, name), delay_allreduce=True))
+
 
         # stopping criterion used for early stopping
         if params.stopping_criterion != '':
@@ -131,6 +139,16 @@ class Trainer(object):
         # initialize lambda coefficients and their configurations
         parse_lambda_config(params)
 
+    def set_shared_specific_parameters(self):
+        params = self.params
+        named_params = []
+        for name in self.MODEL_NAMES:
+            named_params.extend([(k, p) for k, p in getattr(self, name).named_parameters() if p.requires_grad])
+
+        if params.lang_specific_ADPT:
+            self.shared_params = [(k, p) for k, p in named_params if not k.startswith('adapter')]
+            self.specific_params = [(k, p) for k, p in named_params if k.startswith('adapter')]
+
     def set_parameters(self):
         """
         Set parameters.
@@ -159,10 +177,21 @@ class Trainer(object):
         Set optimizers.
         """
         params = self.params
+
         self.optimizers = {}
 
         # model optimizer (excluding memory values)
-        self.optimizers['model'] = get_optimizer(self.parameters['model'], params.optimizer)
+        if params.do_meta_update:
+            if params.shared_param_only_optimizer:
+                self.optimizers['shared'] = get_optimizer([p for k, p in self.shared_params], params.optimizer)
+            else:
+                self.optimizers['shared'] = get_optimizer(self.parameters['model'], params.optimizer)
+            self.optimizers['specific'] = get_optimizer([p for k, p in self.specific_params], params.optimizer)
+        else:
+            if params.prune_test:
+                self.optimizers['model'] = get_optimizer(self.mask_module.parameters(), params.optimizer)
+            else:
+                self.optimizers['model'] = get_optimizer(self.parameters['model'], params.optimizer)
 
         # memory values optimizer
         if params.use_memory:
@@ -191,14 +220,15 @@ class Trainer(object):
             for opt_name, optimizer in zip(opt_names, optimizers)
         }
 
-    def optimize(self, loss):
+    def optimize(self, loss, opt_key=None, lang=None, pre_calculated_grad=False):
         """
         Optimize.
         """
         # check NaN
-        if (loss != loss).data.any():
-            logger.warning("NaN detected")
-            # exit()
+        if not pre_calculated_grad:
+            if (loss != loss).data.any():
+                logger.warning("NaN detected")
+                # exit()
 
         params = self.params
 
@@ -211,6 +241,7 @@ class Trainer(object):
             for optimizer in optimizers:
                 optimizer.zero_grad()
             loss.backward()
+
             if params.clip_grad_norm > 0:
                 for name in names:
                     # norm_check_a = (sum([p.grad.norm(p=2).item() ** 2 for p in self.parameters[name]])) ** 0.5
@@ -222,18 +253,31 @@ class Trainer(object):
 
         # AMP optimization
         else:
+            assert params.accumulate_gradients == 1
             if self.n_iter % params.accumulate_gradients == 0:
-                with apex.amp.scale_loss(loss, optimizers) as scaled_loss:
-                    scaled_loss.backward()
+                if not pre_calculated_grad:
+                    with apex.amp.scale_loss(loss, optimizers) as scaled_loss:
+                        scaled_loss.backward()
                 if params.clip_grad_norm > 0:
-                    for name in names:
-                        # norm_check_a = (sum([p.grad.norm(p=2).item() ** 2 for p in apex.amp.master_params(self.optimizers[name])])) ** 0.5
-                        clip_grad_norm_(apex.amp.master_params(self.optimizers[name]), params.clip_grad_norm)
-                        # norm_check_b = (sum([p.grad.norm(p=2).item() ** 2 for p in apex.amp.master_params(self.optimizers[name])])) ** 0.5
-                        # print(name, norm_check_a, norm_check_b)
-                for optimizer in optimizers:
-                    optimizer.step()
-                    optimizer.zero_grad()
+                    if opt_key is None:
+                        for name in names:
+                            # norm_check_a = (sum([p.grad.norm(p=2).item() ** 2 for p in apex.amp.master_params(self.optimizers[name])])) ** 0.5
+                            clip_grad_norm_(apex.amp.master_params(self.optimizers[name]), params.clip_grad_norm)
+                    else:
+                        clip_grad_norm_(apex.amp.master_params(self.optimizers[opt_key]), params.clip_grad_norm)
+                if opt_key is None:
+                    for optimizer in optimizers:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                else:
+                    if opt_key == 'specific':
+                        for k, p in self.specific_params:
+                            if lang not in k:
+                                p.grad = None
+
+                    self.optimizers[opt_key].step()
+                    for optimizer in optimizers:
+                        optimizer.zero_grad()
             else:
                 with apex.amp.scale_loss(loss, optimizers, delay_unscale=True) as scaled_loss:
                     scaled_loss.backward()
@@ -282,7 +326,7 @@ class Trainer(object):
         # log speed + stats + learning rate
         logger.info(s_iter + s_speed + s_stat + s_lr)
 
-    def get_iterator(self, iter_name, lang1, lang2, stream):
+    def get_iterator(self, iter_name, lang1, lang2, stream, splt='train'):
         """
         Create a new iterator for a dataset.
         """
@@ -290,9 +334,9 @@ class Trainer(object):
         assert stream or not self.params.use_memory or not self.params.mem_query_batchnorm
         if lang2 is None:
             if stream:
-                iterator = self.data['mono_stream'][lang1]['train'].get_iterator(shuffle=True)
+                iterator = self.data['mono_stream'][lang1][splt].get_iterator(shuffle=True)
             else:
-                iterator = self.data['mono'][lang1]['train'].get_iterator(
+                iterator = self.data['mono'][lang1][splt].get_iterator(
                     shuffle=True,
                     group_by_size=self.params.group_by_size,
                     n_sentences=-1,
@@ -300,7 +344,7 @@ class Trainer(object):
         else:
             assert stream is False
             _lang1, _lang2 = (lang1, lang2) if lang1 < lang2 else (lang2, lang1)
-            iterator = self.data['para'][(_lang1, _lang2)]['train'].get_iterator(
+            iterator = self.data['para'][(_lang1, _lang2)][splt].get_iterator(
                 shuffle=True,
                 group_by_size=self.params.group_by_size,
                 n_sentences=-1,
@@ -309,7 +353,7 @@ class Trainer(object):
         self.iterators[(iter_name, lang1, lang2)] = iterator
         return iterator
 
-    def get_batch(self, iter_name, lang1, lang2=None, stream=False):
+    def get_batch(self, iter_name, lang1, lang2=None, stream=False, splt='train'):
         """
         Return a batch of sentences from a dataset.
         """
@@ -318,11 +362,13 @@ class Trainer(object):
         assert stream is False or lang2 is None
         iterator = self.iterators.get((iter_name, lang1, lang2), None)
         if iterator is None:
-            iterator = self.get_iterator(iter_name, lang1, lang2, stream)
+            iterator = self.get_iterator(iter_name, lang1, lang2, stream, splt)
         try:
             x = next(iterator)
         except StopIteration:
-            iterator = self.get_iterator(iter_name, lang1, lang2, stream)
+            if self.params.multiple_files and stream and splt == 'train':
+                self.data['mono_stream'][lang1]['train'].get_next_chunk()
+            iterator = self.get_iterator(iter_name, lang1, lang2, stream, splt)
             x = next(iterator)
         return x if lang2 is None or lang1 < lang2 else x[::-1]
 
@@ -430,12 +476,12 @@ class Trainer(object):
         # define target words to predict
         if params.sample_alpha == 0:
             pred_mask = np.random.rand(slen, bs) <= params.word_pred
-            pred_mask = torch.from_numpy(pred_mask.astype(np.uint8))
+            pred_mask = torch.from_numpy(pred_mask.astype(np.bool))
         else:
             x_prob = params.mask_scores[x.flatten()]
             n_tgt = math.ceil(params.word_pred * slen * bs)
             tgt_ids = np.random.choice(len(x_prob), n_tgt, replace=False, p=x_prob / x_prob.sum())
-            pred_mask = torch.zeros(slen * bs, dtype=torch.uint8)
+            pred_mask = torch.zeros(slen * bs, dtype=torch.bool)
             pred_mask[tgt_ids] = 1
             pred_mask = pred_mask.view(slen, bs)
 
@@ -467,7 +513,7 @@ class Trainer(object):
 
         return x, _x_real, pred_mask
 
-    def generate_batch(self, lang1, lang2, name):
+    def generate_batch(self, lang1, lang2, name, splt='train', max_batch_size=-1):
         """
         Prepare a batch (for causal or non-causal mode).
         """
@@ -476,7 +522,9 @@ class Trainer(object):
         lang2_id = params.lang2id[lang2] if lang2 is not None else None
 
         if lang2 is None:
-            x, lengths = self.get_batch(name, lang1, stream=True)
+            x, lengths = self.get_batch(name, lang1, stream=True, splt=splt)
+            if lengths.size(0) > max_batch_size > 0:
+                x, lengths = x[:, :max_batch_size], lengths[:max_batch_size]
             positions = None
             langs = x.clone().fill_(lang1_id) if params.n_langs > 1 else None
         elif lang1 == lang2:
@@ -654,46 +702,6 @@ class Trainer(object):
         assert x.size(1) % 8 == 0
         return x, lengths, positions, langs, idx
 
-    def clm_step(self, lang1, lang2, lambda_coeff):
-        """
-        Next word prediction step (causal prediction).
-        CLM objective.
-        """
-        assert lambda_coeff >= 0
-        if lambda_coeff == 0:
-            return
-        params = self.params
-        name = 'model' if params.encoder_only else 'decoder'
-        model = getattr(self, name)
-        model.train()
-
-        # generate batch / select words to predict
-        x, lengths, positions, langs, _ = self.generate_batch(lang1, lang2, 'causal')
-        x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
-        alen = torch.arange(lengths.max(), dtype=torch.long, device=lengths.device)
-        pred_mask = alen[:, None] < lengths[None] - 1
-        if params.context_size > 0:  # do not predict without context
-            pred_mask[:params.context_size] = 0
-        y = x[1:].masked_select(pred_mask[:-1])
-        assert pred_mask.sum().item() == y.size(0)
-
-        # cuda
-        x, lengths, langs, pred_mask, y = to_cuda(x, lengths, langs, pred_mask, y)
-
-        # forward / loss
-        tensor = model('fwd', x=x, lengths=lengths, langs=langs, causal=True)
-        _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
-        self.stats[('CLM-%s' % lang1) if lang2 is None else ('CLM-%s-%s' % (lang1, lang2))].append(loss.item())
-        loss = lambda_coeff * loss
-
-        # optimize
-        self.optimize(loss)
-
-        # number of processed sentences / words
-        self.n_sentences += params.batch_size
-        self.stats['processed_s'] += lengths.size(0)
-        self.stats['processed_w'] += pred_mask.sum().item()
-
     def mlm_step(self, lang1, lang2, lambda_coeff):
         """
         Masked word prediction step.
@@ -716,7 +724,7 @@ class Trainer(object):
         x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
 
         # forward / loss
-        tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)
+        tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False, lang=lang1)
         _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
         self.stats[('MLM-%s' % lang1) if lang2 is None else ('MLM-%s-%s' % (lang1, lang2))].append(loss.item())
         loss = lambda_coeff * loss
@@ -729,60 +737,82 @@ class Trainer(object):
         self.stats['processed_s'] += lengths.size(0)
         self.stats['processed_w'] += pred_mask.sum().item()
 
-    def pc_step(self, lang1, lang2, lambda_coeff):
-        """
-        Parallel classification step. Predict if pairs of sentences are mutual translations of each other.
-        """
-        assert lambda_coeff >= 0
-        if lambda_coeff == 0:
-            return
+    def meta_mlm_step(self, lang):
+
         params = self.params
-        name = 'model' if params.encoder_only else 'encoder'
+        name = 'model'
         model = getattr(self, name)
         model.train()
 
-        lang1_id = params.lang2id[lang1]
-        lang2_id = params.lang2id[lang2]
+        # Step 1: Update shared param
+        # generate batch / select words to predict
+        x, lengths, positions, langs, _ = self.generate_batch(lang, None, 'pred')
+        x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
+        x, y, pred_mask = self.mask_out(x, lengths)
 
-        # sample parallel sentences
-        (x1, len1), (x2, len2) = self.get_batch('align', lang1, lang2)
-        bs = len1.size(0)
-        if bs == 1:  # can happen (although very rarely), which makes the negative loss fail
-            self.n_sentences += params.batch_size
-            return
+        # cuda
+        x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
 
-        # associate lang1 sentences with their translations, and random lang2 sentences
-        y = torch.LongTensor(bs).random_(2)
-        idx_pos = torch.arange(bs)
-        idx_neg = ((idx_pos + torch.LongTensor(bs).random_(1, bs)) % bs)
-        idx = (y == 1).long() * idx_pos + (y == 0).long() * idx_neg
-        x2, len2 = x2[:, idx], len2[idx]
-
-        # generate batch / cuda
-        x, lengths, positions, langs = concat_batches(x1, len1, lang1_id, x2, len2, lang2_id, params.pad_index, params.eos_index, reset_positions=False)
-        x, lengths, positions, langs, new_idx = self.round_batch(x, lengths, positions, langs)
-        if new_idx is not None:
-            y = y[new_idx]
-        x, lengths, positions, langs = to_cuda(x, lengths, positions, langs)
-
-        # get sentence embeddings
-        h = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False)[0]
-
-        # parallel classification loss
-        CLF_ID1, CLF_ID2 = 8, 9  # very hacky, use embeddings to make weights for the classifier
-        emb = (model.module if params.multi_gpu else model).embeddings.weight
-        pred = F.linear(h, emb[CLF_ID1].unsqueeze(0), emb[CLF_ID2, 0])
-        loss = F.binary_cross_entropy_with_logits(pred.view(-1), y.to(pred.device).type_as(pred))
-        self.stats['PC-%s-%s' % (lang1, lang2)].append(loss.item())
-        loss = lambda_coeff * loss
+        # forward / loss
+        tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False, lang=lang)
+        _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
+        self.stats[('MLM-%s' % lang) ].append(loss.item())
 
         # optimize
-        self.optimize(loss)
+        self.optimize(loss, opt_key='shared')
 
         # number of processed sentences / words
         self.n_sentences += params.batch_size
-        self.stats['processed_s'] += bs
-        self.stats['processed_w'] += lengths.sum().item()
+        self.stats['processed_s'] += lengths.size(0)
+        self.stats['processed_w'] += pred_mask.sum().item()
+
+        # Step 2: Update language-specific param
+        original_params = {param[0]: param[1] for param in self.shared_params}
+
+        # x_train
+        x, lengths, positions, langs, _ = self.generate_batch(lang, None, 'pred')
+        x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
+        x, y, pred_mask = self.mask_out(x, lengths)
+        x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
+        tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False, lang=lang)
+        _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False)
+
+        grad = torch.autograd.grad(loss, original_params.values(), create_graph=True, retain_graph=True)
+
+        if params.use_current_lr:
+            E = self.optimizers['shared'].param_groups[0]['lr']
+        else:
+            E = params.adapt_lr
+
+        adapted_params = dict(
+            zip(original_params.keys(), [original_params[key] - E * grad[i] for i, key in
+                                         enumerate(original_params.keys())]))
+        if params.share_inout_emb:
+            adapted_params['pred_layer.proj.weight'] = adapted_params['embeddings.weight']
+
+        # x_valid (can use train instead)
+        split = 'valid' if params.meta_use_valid_set else 'train'
+
+        total_valid_loss = 0.0
+        for lg in params.lgs:
+            if params.only_valid_other_langs and lg == lang:
+                continue
+            if split == 'valid':
+                x, lengths, positions, langs, _ = self.generate_batch(lg, None, 'valid', splt=split, max_batch_size=params.valid_max_batch_size)
+            else:
+                x, lengths, positions, langs, _ = self.generate_batch(lg, None, 'pred', splt=split, max_batch_size=params.valid_max_batch_size)
+            x, lengths, positions, langs, _ = self.round_batch(x, lengths, positions, langs)
+            x, y, pred_mask = self.mask_out(x, lengths)
+            x, y, pred_mask, lengths, positions, langs = to_cuda(x, y, pred_mask, lengths, positions, langs)
+            tensor = model('fwd', x=x, lengths=lengths, positions=positions, langs=langs, causal=False, lang=lg, params=adapted_params)
+            _, loss = model('predict', tensor=tensor, pred_mask=pred_mask, y=y, get_scores=False, params=adapted_params)
+            total_valid_loss += loss
+
+        if params.only_valid_other_langs:
+            total_valid_loss = total_valid_loss / (len(params.lgs) - 1)
+        else:
+            total_valid_loss = total_valid_loss / len(params.lgs)
+        self.optimize(total_valid_loss, opt_key='specific', lang=lang)
 
 
 class SingleTrainer(Trainer):
