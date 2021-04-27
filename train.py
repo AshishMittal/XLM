@@ -12,7 +12,7 @@ import os
 
 from src.slurm import init_signal_handler, init_distributed_mode
 from src.data.loader import check_data_params, load_data
-from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order, output_parameter_sizes, output_gradient
+from src.utils import bool_flag, initialize_exp, set_sampling_probs, shuf_order
 from src.model import check_model_params, build_model
 from src.model.memory import HashingMemory
 from src.trainer import SingleTrainer, EncDecTrainer
